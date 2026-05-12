@@ -1,16 +1,52 @@
 import /init.recovery.microtrust.rc
 
+# ============================================================
+# [STOCK] on init - MUST preserve from stock init.recovery.mt6768.rc
+# ============================================================
 on init
-    mkdir /mnt/vendor/persist 0700 root root
+    # Create standard block device symlink (stock has this)
+    symlink /dev/block/platform/bootdevice /dev/block/bootdevice
+    
+    # Set library path for vendor binaries (CRITICAL for teei_daemon, keymaster)
+    export LD_LIBRARY_PATH /system/lib64:/vendor/lib64:/vendor/lib64/hw:/system/lib64/hw
+    
+    # Mount persist partition for Beanpod TEE secure storage
+    mkdir /mnt/vendor/persist 0771 root root
     mount ext4 /dev/block/platform/bootdevice/by-name/persist /mnt/vendor/persist
 
+# ============================================================
+# [STOCK] on fs
+# ============================================================
 on fs
     install_keyring
     setprop crypto.ready 1
 
-on boot
-    start health-hal-2-0
+# ============================================================
+# [STOCK] on post-fs - CRITICAL for dynamic partition paths
+# ============================================================
+on post-fs
+    # mtk.plpath.utils.link sets up super partition block device paths
+    # Without this, dynamic partitions (system, vendor, product) are inaccessible
+    start mtk.plpath.utils.link
 
+service mtk.plpath.utils.link /system/bin/mtk_plpath_utils
+    class main
+    user root
+    group root system
+    oneshot
+    disabled
+    seclabel u:r:recovery:s0
+
+# ============================================================
+# [STOCK] on boot - hardware HALs required for recovery
+# ============================================================
+on boot
+    start boot-hal-1-2
+    start health-hal-2-1
+
+# ============================================================
+# Keystore services
+# ============================================================
 service keystore_auth /system/bin/keystore_auth
     oneshot
     user system
@@ -24,22 +60,54 @@ service keystore /system/bin/keystore /tmp/misc/keystore
     disabled
     seclabel u:r:recovery:s0
 
+# ============================================================
+# Gatekeeper service (Beanpod)
+# ============================================================
 service gatekeeper-1-0 /vendor/bin/hw/android.hardware.gatekeeper@1.0-service
+    interface android.hardware.gatekeeper@1.0::IGatekeeper default
+    class hal
     user root
     group root
     disabled
     seclabel u:r:recovery:s0
 
+# ============================================================
+# Keymaster 4.0 service (Beanpod - X659B specific)
+# ============================================================
 service keymaster-4-0 /vendor/bin/hw/android.hardware.keymaster@4.0-service.beanpod
+    interface android.hardware.keymaster@4.0::IKeymasterDevice default
+    class early_hal
     user root
     group root drmrpc
     disabled
     seclabel u:r:recovery:s0
 
+# ============================================================
+# [CRITICAL FIX] Start keymaster when listener registers
+# Beanpod keymaster needs this signal before HAL registration
+# ============================================================
+on property:vendor.sys.listener.registered=true
+    start gatekeeper-1-0
+    start keymaster-4-0
+
+# ============================================================
+# [CRITICAL FIX] Start keymaster when crypto is ready (TWRP FBE)
+# TWRP sets crypto.ready=1 after mounting /data
+# Without this trigger, keymaster NEVER starts in recovery
+# ============================================================
+on property:crypto.ready=1
+    start keymaster-4-0
+
+# ============================================================
+# Start keymaster when hwservicemanager is ready
+# ============================================================
 on property:hwservicemanager.ready=true
     start keymaster-4-0
     start gatekeeper-1-0
 
+# ============================================================
+# Stop services when encryption is unsupported/unencrypted
+# ============================================================
 on property:ro.crypto.state=unsupported
     stop teei_daemon
     stop keymaster-4-0
@@ -50,6 +118,9 @@ on property:ro.crypto.state=unencrypted
     stop keymaster-4-0
     stop gatekeeper-1-0
 
+# ============================================================
+# Stop services when TWRP decryption is done
+# ============================================================
 on property:twrp.decrypt.done=true
     stop teei_daemon
     stop keymaster-4-0
